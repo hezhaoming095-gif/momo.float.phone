@@ -30,6 +30,7 @@ import {
     NOVELAI_RESOLUTION_OPTIONS,
     NOVELAI_SAMPLER_OPTIONS,
 } from "@/lib/novelai-image-config";
+import { isMiniMaxBaseUrl } from "@/lib/minimax-image";
 
 const SIZE_OPTIONS = ["auto", "1024x1024", "1024x1536", "1536x1024"];
 const QUALITY_OPTIONS = ["auto", "low", "medium", "high"];
@@ -1012,6 +1013,12 @@ export function ImageGenerationSettings() {
                                 onChange={(event) => updateOpenAiPreset({ baseUrl: event.target.value })}
                                 placeholder="https://api.example.com/v1"
                             />
+                            {isMiniMaxBaseUrl(activeOpenAiPreset.baseUrl) && (
+                                <span className="menu-desc ml-1">
+                                    检测到 MiniMax 官方地址：已自动改用原生接口 /v1/image_generation（MiniMax 没有 OpenAI 兼容的生图端点）。
+                                    模型名留空默认 image-01；提示词超过 1500 字会自动截断；参考图会以 Data URL 形式直传。
+                                </span>
+                            )}
                         </div>
 
                         <div className="flex flex-col gap-1">
