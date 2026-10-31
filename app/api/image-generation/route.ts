@@ -13,6 +13,13 @@ import {
   normalizeNovelAiScale,
   normalizeNovelAiSteps,
 } from "@/lib/novelai-image-config";
+import {
+  buildMiniMaxImageRequest,
+  buildMiniMaxImageUrl,
+  detectImageMimeType,
+  isMiniMaxBaseUrl,
+  parseMiniMaxImageResponse,
+} from "@/lib/minimax-image";
 
 export const maxDuration = 120;
 
@@ -74,7 +81,9 @@ function dataUrlToBlob(dataUrl: string): { blob: Blob; mimeType: string } | null
 function cleanBase64(value: string): { b64: string; mimeType?: string } {
   const match = /^data:([^;]+);base64,([\s\S]+)$/.exec(value.trim());
   if (match) return { mimeType: match[1], b64: match[2] };
-  return { b64: value.trim() };
+  // 裸 base64：从魔术字节猜真实格式（很多上游返回的是 JPEG 而不是 PNG）
+  const raw = value.trim();
+  return { b64: raw, mimeType: detectImageMimeType(raw) };
 }
 
 function extractFromObject(data: unknown): ExtractedImage | null {
@@ -297,9 +306,81 @@ async function runNovelAiGeneration(input: ImageGenerationRequest): Promise<{ st
   }
 }
 
+// MiniMax 原生生图：浏览器直连被跨域拦住时的兜底路径（客户端已打同一套适配补丁）。
+// MiniMax 没有 OpenAI 兼容的生图端点，必须走 /v1/image_generation 原生协议，
+// 所以这里不能复用上面的 OpenAI 分支。
+async function runMiniMaxGeneration(input: ImageGenerationRequest): Promise<{ status: number; body: Record<string, unknown> }> {
+  try {
+    const apiKey = input.apiKey?.trim();
+    const prompt = input.prompt?.trim();
+    if (!apiKey) return { status: 400, body: { error: "缺少 API Key" } };
+    if (!prompt) return { status: 400, body: { error: "缺少提示词" } };
+
+    const url = buildMiniMaxImageUrl(input.baseUrl);
+    const payload = buildMiniMaxImageRequest({
+      model: input.model,
+      prompt,
+      size: input.size,
+      referenceImageDataUrl: input.referenceImageDataUrl,
+    });
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120_000);
+    let res: Response;
+    try {
+      res = await externalFetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    const text = await res.text();
+    if (!res.ok) {
+      return { status: 502, body: { error: `MiniMax 生图 API 错误 ${res.status}: ${text.slice(0, 600)}` } };
+    }
+
+    let json: unknown;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      return { status: 502, body: { error: `MiniMax 返回的不是有效 JSON：${text.slice(0, 300)}` } };
+    }
+
+    // MiniMax 出错时 HTTP 也是 200，错误码在 base_resp.status_code 里。
+    const parsed = parseMiniMaxImageResponse(json);
+    if (!parsed.ok) {
+      return { status: parsed.httpStatus || 502, body: { error: parsed.error } };
+    }
+    if (parsed.b64) {
+      return { status: 200, body: { b64: parsed.b64, mimeType: parsed.mimeType || "image/png" } };
+    }
+    if (parsed.url) {
+      const downloaded = await fetchImageUrl(parsed.url);
+      return { status: 200, body: { ...downloaded } };
+    }
+    return { status: 502, body: { error: "MiniMax 返回中没有图片数据" } };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const status = message.toLowerCase().includes("abort") ? 504 : 502;
+    return { status, body: { error: message } };
+  }
+}
+
 async function runImageGeneration(input: ImageGenerationRequest): Promise<{ status: number; body: Record<string, unknown> }> {
   if (input.provider === "novelai") {
     return runNovelAiGeneration(input);
+  }
+
+  // MiniMax 原生协议：靠 baseUrl 识别，不改动客户端的预设数据结构。
+  if (isMiniMaxBaseUrl(input.baseUrl)) {
+    return runMiniMaxGeneration(input);
   }
 
   try {
