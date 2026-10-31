@@ -14,6 +14,7 @@ import type { UserIdentity } from "@/components/settings/user-identity";
 import { loadCharacters } from "@/lib/character-storage";
 import type { Character } from "@/lib/character-types";
 import { getChatImageFromIndexedDB, saveChatImageToIndexedDB } from "@/lib/chat-asset-storage";
+import { describeAssetSaveError } from "@/lib/theme-storage";
 import {
     fetchImageGenerationModels,
     fetchNovelAiModels,
@@ -96,6 +97,7 @@ export function ImageGenerationSettings() {
     const [isFetchingNaiModels, setIsFetchingNaiModels] = useState(false);
     const [isTesting, setIsTesting] = useState(false);
     const [status, setStatus] = useState<Status | null>(null);
+    const [uploadStatus, setUploadStatus] = useState<Status | null>(null);
     const [naiTokenStatus, setNaiTokenStatus] = useState<Status | null>(null);
     const [testPreviewUrl, setTestPreviewUrl] = useState<string | null>(null);
     const [pendingDeletePresetId, setPendingDeletePresetId] = useState<string | null>(null);
@@ -414,47 +416,98 @@ export function ImageGenerationSettings() {
         }
     };
 
+    /**
+     * 统一的参考图上传入口：把真实错误显示出来。
+     * 以前这里没有 try/catch，IndexedDB 一旦失败就变成 unhandled rejection，
+     * 界面一点反应都没有，用户只会以为"按钮坏了"。
+     */
+    const runAssetUpload = async (label: string, task: () => Promise<void>) => {
+        setUploadStatus(null);
+        try {
+            await task();
+            setUploadStatus({ success: true, message: `${label}已上传。` });
+        } catch (error) {
+            setUploadStatus({
+                success: false,
+                message: describeAssetSaveError(error, `${label}上传失败，请重试`),
+            });
+        }
+    };
+
+    /**
+     * 动态创建 file input 选图。
+     * 挂到 DOM 上再点击，并先清空 value，保证重复选同一张图也能触发 change。
+     */
+    const pickImageFile = (onPicked: (file: File) => Promise<void> | void) => {
+        const input = document.createElement("input");
+        input.type = "file";
+        input.accept = "image/*";
+        input.style.position = "fixed";
+        input.style.left = "-9999px";
+        input.style.opacity = "0";
+        input.onchange = async () => {
+            const file = input.files?.[0];
+            input.remove();
+            if (!file) return;
+            try {
+                await onPicked(file);
+            } catch (error) {
+                setUploadStatus({
+                    success: false,
+                    message: describeAssetSaveError(error, "参考图上传失败，请重试"),
+                });
+            }
+        };
+        document.body.appendChild(input);
+        input.value = "";
+        input.click();
+    };
+
     const uploadReference = async (characterId: string, file: File) => {
-        const assetId = await saveChatImageToIndexedDB(file);
-        const current = settings.characterReferences?.[characterId];
-        const faceCrop = current?.faceCrop || { x: 0.27, y: 0.12, size: 0.46 };
-        persist({
-            ...settings,
-            characterReferences: {
-                ...(settings.characterReferences || {}),
-                [characterId]: {
-                    ...current,
-                    assetId,
-                    updatedAt: Date.now(),
-                    enabled: true,
-                    faceCrop,
+        await runAssetUpload("角色参考图", async () => {
+            const assetId = await saveChatImageToIndexedDB(file);
+            const current = settings.characterReferences?.[characterId];
+            const faceCrop = current?.faceCrop || { x: 0.27, y: 0.12, size: 0.46 };
+            persist({
+                ...settings,
+                characterReferences: {
+                    ...(settings.characterReferences || {}),
+                    [characterId]: {
+                        ...current,
+                        assetId,
+                        updatedAt: Date.now(),
+                        enabled: true,
+                        faceCrop,
+                    },
                 },
-            },
+            });
+            setCropDraft(faceCrop);
+            setCropCharacterId(characterId);
         });
-        setCropDraft(faceCrop);
-        setCropCharacterId(characterId);
     };
 
     const uploadUserReference = async (identityId: string, file: File) => {
-        const assetId = await saveChatImageToIndexedDB(file);
-        const current = settings.userReferences?.[identityId];
-        const faceCrop = current?.faceCrop || { x: 0.27, y: 0.12, size: 0.46 };
-        persist({
-            ...settings,
-            userReferences: {
-                ...(settings.userReferences || {}),
-                [identityId]: {
-                    ...current,
-                    assetId,
-                    updatedAt: Date.now(),
-                    enabled: true,
-                    faceCrop,
+        await runAssetUpload("用户参考图", async () => {
+            const assetId = await saveChatImageToIndexedDB(file);
+            const current = settings.userReferences?.[identityId];
+            const faceCrop = current?.faceCrop || { x: 0.27, y: 0.12, size: 0.46 };
+            persist({
+                ...settings,
+                userReferences: {
+                    ...(settings.userReferences || {}),
+                    [identityId]: {
+                        ...current,
+                        assetId,
+                        updatedAt: Date.now(),
+                        enabled: true,
+                        faceCrop,
+                    },
                 },
-            },
+            });
+            setCropDraft(faceCrop);
+            setCropViewport({ width: 0, height: 0 });
+            setCropUserIdentityId(identityId);
         });
-        setCropDraft(faceCrop);
-        setCropViewport({ width: 0, height: 0 });
-        setCropUserIdentityId(identityId);
     };
 
     const updateUserReference = (
@@ -525,8 +578,10 @@ export function ImageGenerationSettings() {
     };
 
     const uploadCharacterAnchor = async (characterId: string, anchorId: string, file: File) => {
-        const assetId = await saveChatImageToIndexedDB(file);
-        updateCharacterAnchor(characterId, anchorId, { assetId, enabled: true });
+        await runAssetUpload("锚点参考图", async () => {
+            const assetId = await saveChatImageToIndexedDB(file);
+            updateCharacterAnchor(characterId, anchorId, { assetId, enabled: true });
+        });
     };
 
     const openFaceCrop = (characterId: string) => {
@@ -1259,7 +1314,11 @@ export function ImageGenerationSettings() {
                                     <span className="min-w-0 flex-1">
                                         <span className="menu-label block truncate">{identity.name || "未命名身份"}</span>
                                         <span className="menu-desc block truncate">
-                                            {preview ? (reference?.enabled === false ? "参考图已关闭" : "参考图已启用") : "未上传独立参考图"}
+                                            {preview
+                                                ? (reference?.enabled === false ? "参考图已关闭" : "参考图已启用")
+                                                : reference?.assetId
+                                                    ? "参考图读取失败，请重新上传"
+                                                    : "未上传独立参考图"}
                                         </span>
                                     </span>
                                     {preview && (
@@ -1276,16 +1335,7 @@ export function ImageGenerationSettings() {
                                     <button
                                         type="button"
                                         className="ui-btn ui-btn-soft-action flex-1"
-                                        onClick={() => {
-                                            const input = document.createElement("input");
-                                            input.type = "file";
-                                            input.accept = "image/*";
-                                            input.onchange = async () => {
-                                                const file = input.files?.[0];
-                                                if (file) await uploadUserReference(identity.id, file);
-                                            };
-                                            input.click();
-                                        }}
+                                        onClick={() => pickImageFile((file) => uploadUserReference(identity.id, file))}
                                     >
                                         <Upload size={15} />
                                         {preview ? "更换" : "上传参考图"}
@@ -1309,11 +1359,27 @@ export function ImageGenerationSettings() {
                             </div>
                         );
                     })}
+                    {uploadStatus && (
+                        <div role={uploadStatus.success ? "status" : "alert"}>
+                            <Alert variant={uploadStatus.success ? "success" : "danger"}>
+                                <AlertCircle size={16} className="mt-[2px] shrink-0" />
+                                <span className="break-all leading-[1.5]">{uploadStatus.message}</span>
+                            </Alert>
+                        </div>
+                    )}
                 </div>
             </div>
 
             <div className="flex flex-col gap-2">
                 <p className="settings-menu-section-title">Character Identity</p>
+                {uploadStatus && (
+                    <div role={uploadStatus.success ? "status" : "alert"}>
+                        <Alert variant={uploadStatus.success ? "success" : "danger"}>
+                            <AlertCircle size={16} className="mt-[2px] shrink-0" />
+                            <span className="break-all leading-[1.5]">{uploadStatus.message}</span>
+                        </Alert>
+                    </div>
+                )}
                 {settings.provider === "novelai" && (
                     <Alert variant="info">
                         <Info size={16} className="mt-[2px] shrink-0" />
@@ -1434,16 +1500,7 @@ export function ImageGenerationSettings() {
                                 <button
                                     type="button"
                                     className="ui-btn ui-btn-soft-action flex-1"
-                                    onClick={() => {
-                                        const input = document.createElement("input");
-                                        input.type = "file";
-                                        input.accept = "image/*";
-                                        input.onchange = async () => {
-                                            const file = input.files?.[0];
-                                            if (file) await uploadReference(selectedCharacter.id, file);
-                                        };
-                                        input.click();
-                                    }}
+                                    onClick={() => pickImageFile((file) => uploadReference(selectedCharacter.id, file))}
                                 >
                                     <Upload size={16} />
                                     {referencePreviews[selectedCharacter.id] ? "更换参考图" : "选择参考图"}
@@ -1479,16 +1536,7 @@ export function ImageGenerationSettings() {
                                                 <button
                                                     type="button"
                                                     className="grid h-14 w-14 shrink-0 place-items-center overflow-hidden rounded-xl bg-[var(--c-page-body-bg)] text-[var(--c-icon)]"
-                                                    onClick={() => {
-                                                        const input = document.createElement("input");
-                                                        input.type = "file";
-                                                        input.accept = "image/*";
-                                                        input.onchange = async () => {
-                                                            const file = input.files?.[0];
-                                                            if (file) await uploadCharacterAnchor(selectedCharacter.id, anchor.id, file);
-                                                        };
-                                                        input.click();
-                                                    }}
+                                                    onClick={() => pickImageFile((file) => uploadCharacterAnchor(selectedCharacter.id, anchor.id, file))}
                                                 >
                                                     {anchorPreviews[anchor.id] ? (
                                                         <img src={anchorPreviews[anchor.id]} alt="" className="h-full w-full object-cover" />
