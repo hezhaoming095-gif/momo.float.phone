@@ -16,6 +16,13 @@ import {
   normalizeNovelAiScale,
   normalizeNovelAiSteps,
 } from "./novelai-image-config";
+import {
+  buildMiniMaxImageRequest,
+  buildMiniMaxImageUrl,
+  detectImageMimeType,
+  isMiniMaxBaseUrl,
+  parseMiniMaxImageResponse,
+} from "./minimax-image";
 
 export type ImageGenerationResult = {
   mediaRef: string;
@@ -223,7 +230,10 @@ function buildModelsUrl(baseUrl: string): string {
 function cleanBase64(value: string): { b64: string; mimeType?: string } {
   const match = /^data:([^;]+);base64,([\s\S]+)$/.exec(value.trim());
   if (match) return { mimeType: match[1], b64: match[2] };
-  return { b64: value.trim() };
+  // 裸 base64：从魔术字节猜真实格式（很多中转返回的是 JPEG 而不是 PNG，
+  // 写死 image/png 会让 Blob 的 MIME 与实际字节对不上）。
+  const raw = value.trim();
+  return { b64: raw, mimeType: detectImageMimeType(raw) };
 }
 
 function extractFromObject(data: unknown): ExtractedImage | null {
@@ -355,6 +365,17 @@ export function filterLikelyImageModels(models: string[]): string[] {
   return filtered.length > 0 ? filtered : models;
 }
 
+function ensureMiniMaxImageModels(baseUrl: string, models: string[]): string[] {
+  // MiniMax 官方 /v1/models 只返回**对话**模型，不含 image-01 / image-01-live，
+  // 但生图用的就是这两个模型。不补的话模型下拉框里根本选不到，只能手填。
+  if (!isMiniMaxBaseUrl(baseUrl)) return models;
+  const merged = [...models];
+  for (const id of ["image-01", "image-01-live"]) {
+    if (!merged.includes(id)) merged.push(id);
+  }
+  return merged;
+}
+
 export async function fetchImageGenerationModels(settings: Pick<ImageGenerationSettings, "apiKey" | "baseUrl" | "requestMode">): Promise<string[]> {
   if (settings.requestMode === "direct") {
     try {
@@ -366,7 +387,7 @@ export async function fetchImageGenerationModels(settings: Pick<ImageGenerationS
       if (!res.ok) {
         throw new Error(`模型列表 API 错误 ${res.status}: ${text.slice(0, 400)}`);
       }
-      return extractModels(JSON.parse(text));
+      return ensureMiniMaxImageModels(settings.baseUrl, extractModels(JSON.parse(text)));
     } catch (error) {
       if (error instanceof TypeError) {
         throw new Error("浏览器直连失败：该 API 可能未允许跨域请求。");
@@ -387,7 +408,7 @@ export async function fetchImageGenerationModels(settings: Pick<ImageGenerationS
   if (!res.ok || data.error) {
     throw new Error(data.error || `模型列表请求失败 ${res.status}`);
   }
-  return Array.isArray(data.models) ? data.models : [];
+  return ensureMiniMaxImageModels(settings.baseUrl, Array.isArray(data.models) ? data.models : []);
 }
 
 // 通用生图代理(Cloudflare Worker)。配置后,「服务端中转」模式改为:
@@ -451,6 +472,97 @@ async function generateImageDirect(params: {
   } finally {
     clearTimeout(totalTimer);
     if (signal) signal.removeEventListener("abort", onOuterAbort);
+  }
+}
+
+// MiniMax 原生生图:浏览器直连 api.minimax.cn/v1/image_generation。
+// 与 OpenAI 兼容接口的差异很大(端点、请求体、响应体、错误码位置都不同),
+// 翻译逻辑集中在 lib/minimax-image.ts,这里只负责发请求和取图。
+//
+// 为什么优先直连:MiniMax 对任意 Origin 放行 CORS(已实测真实响应也带
+// Access-Control-Allow-Origin),所以订阅 Key 可以只留在浏览器里,完全不经过
+// Netlify 函数——既不多一个公网暴露面,也不消耗站点的函数额度。
+async function generateImageMiniMaxDirect(params: {
+  settings: ImageGenerationSettings;
+  prompt: string;
+  referenceImageDataUrl: string | null;
+  signal?: AbortSignal;
+}): Promise<ImageGenerationApiResponse> {
+  const { settings, prompt, referenceImageDataUrl, signal } = params;
+  throwIfAborted(signal);
+
+  const url = buildMiniMaxImageUrl(settings.baseUrl);
+  const body = buildMiniMaxImageRequest({
+    model: settings.model,
+    prompt,
+    size: settings.size,
+    referenceImageDataUrl,
+  });
+
+  const controller = new AbortController();
+  const onOuterAbort = () => controller.abort();
+  if (signal) signal.addEventListener("abort", onOuterAbort, { once: true });
+  const totalTimer = setTimeout(() => controller.abort(), 360_000);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${settings.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    throwIfAborted(signal);
+    if (!res.ok) {
+      throw new Error(`MiniMax 生图 API 错误 ${res.status}: ${text.slice(0, 600)}`);
+    }
+    let json: unknown;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new Error(`MiniMax 返回的不是有效 JSON：${text.slice(0, 300)}`);
+    }
+    // 注意:MiniMax 出错时 HTTP 也是 200,错误码在 base_resp.status_code 里,
+    // 这里由 parseMiniMaxImageResponse 统一识别。
+    const parsed = parseMiniMaxImageResponse(json);
+    if (!parsed.ok) throw new Error(parsed.error || "MiniMax 生图失败");
+    if (parsed.b64) return { b64: parsed.b64, mimeType: parsed.mimeType || "image/png" };
+    if (parsed.url) return await fetchImageUrlAsBase64(parsed.url, signal);
+    throw new Error("MiniMax 返回中没有图片数据");
+  } catch (error) {
+    if (controller.signal.aborted && !signal?.aborted) {
+      throw new Error("MiniMax 生图请求超时（360 秒未返回）");
+    }
+    if (error instanceof TypeError) {
+      // 浏览器把跨域拦截、网络断开等都归为 TypeError,交给上层决定是否回落。
+      throw new Error("浏览器直连失败：该 API 可能未允许跨域请求。");
+    }
+    throw error;
+  } finally {
+    clearTimeout(totalTimer);
+    if (signal) signal.removeEventListener("abort", onOuterAbort);
+  }
+}
+
+// MiniMax 专用入口:先直连(订阅 Key 不出浏览器),只有跨域被拦时才回落 Netlify
+// 函数(该函数已打上 MiniMax 适配补丁,走的是同一套翻译逻辑)。
+async function generateImageMiniMax(params: {
+  settings: ImageGenerationSettings;
+  prompt: string;
+  referenceImageDataUrl: string | null;
+  signal?: AbortSignal;
+}): Promise<ImageGenerationApiResponse> {
+  try {
+    return await generateImageMiniMaxDirect(params);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    // 只有连接层失败(跨域/断网)才回落;API 自身的错误(密钥无效、余额不足、
+    // 内容安全拦截)说明请求已经到达上游,换条路走也是同样的错,直接抛出避免重复计费。
+    if (!message.includes("浏览器直连失败")) throw error;
+    throwIfAborted(params.signal);
+    return generateImageViaServer(params);
   }
 }
 
@@ -887,7 +999,10 @@ export async function generateImageFromConfiguredApi(params: {
   const openaiPreset = settings.openaiPresets?.find(preset => preset.id === settings.activeOpenAiPresetId)
     || settings.openaiPresets?.[0];
   const openaiSettings = openaiPreset ? { ...settings, ...openaiPreset } : settings;
-  if (!openaiSettings.apiKey.trim() || !openaiSettings.baseUrl.trim() || !openaiSettings.model.trim()) return null;
+  // MiniMax 走的是原生协议（不是 OpenAI 兼容端点），模型名可以留空，默认 image-01。
+  const isMiniMax = isMiniMaxBaseUrl(openaiSettings.baseUrl);
+  if (!openaiSettings.apiKey.trim() || !openaiSettings.baseUrl.trim()) return null;
+  if (!isMiniMax && !openaiSettings.model.trim()) return null;
 
   const reference = params.characterId ? settings.characterReferences?.[params.characterId] : undefined;
   // 「非自拍不使用参考图」开关已从生图设置页删除：参考图启用后始终参与生成
@@ -943,9 +1058,12 @@ export async function generateImageFromConfiguredApi(params: {
     openaiSettings.extraPrompt,
   );
 
-  const data = openaiSettings.requestMode === "direct"
-    ? await generateImageDirect({ settings: openaiSettings, prompt, referenceImageDataUrl, signal: params.signal })
-    : await generateImageViaServerOrProxy({ settings: openaiSettings, prompt, referenceImageDataUrl, signal: params.signal });
+  // MiniMax 走原生协议：先浏览器直连（订阅 Key 不出浏览器），跨域被拦才回落 Netlify 函数。
+  const data = isMiniMax
+    ? await generateImageMiniMax({ settings: openaiSettings, prompt, referenceImageDataUrl, signal: params.signal })
+    : openaiSettings.requestMode === "direct"
+      ? await generateImageDirect({ settings: openaiSettings, prompt, referenceImageDataUrl, signal: params.signal })
+      : await generateImageViaServerOrProxy({ settings: openaiSettings, prompt, referenceImageDataUrl, signal: params.signal });
 
   throwIfAborted(params.signal);
   const mimeType = data.mimeType || "image/png";
